@@ -47,9 +47,10 @@ FLAGS = parser.parse_args()
 # ##############################################################################
 
 class Network(object):
-    def __init__(self, batch_maker):
+    def __init__(self, eval=False):
         with tf.variable_scope('queue') as scope:
-            self.images, self.labels = input_pipeline.
+            input_pipeline = InputPipeline(eval)
+            self.images, self.labels = input_pipeline.next_batch()
 
         self.keep_prob = tf.placeholder(tf.float32)
         # conv1
@@ -207,44 +208,44 @@ class Network(object):
         self.merged_summary_op = tf.summary.merge_all()
 
 
-def train(net, batch_maker):
+def train(net):
     timer = Timer(8)
-    qrunner = tf.train.QueueRunner(queue, [batch_maker.enqueue_preprocessed] * 4)
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
         summary_writer = tf.summary.FileWriter(
             Settings.path_training_summaries + '/run_' +
             str(Settings.nb_run), sess.graph)
         coord = tf.train.Coordinator()
-        enqueue_threads = qrunner.create_threads(sess, coord=coord, start=True)
-        for step in xrange(FLAGS.nb_steps):
-            # Print training summary every 10 steps
-            if coord.should_stop():
-                break
-            if step % 10 == 0:
-                timer.start(0)
-                _, loss, top1, summary = sess.run(
-                    [net.train_op, net.loss, net.top1, net.merged_summary_op],
-                    feed_dict={net.keep_prob: 0.5})
-                timer.end(0)
-                summary_writer.add_summary(summary)
-                print('Step ' + str(current_step).zfill(3) +
-                      '| Loss: %.3f' % loss +
-                      '| Top1: %.3f' % top1)
-                timer.print_performance()
-                print("=======================================================")
-                """
-				# Quickval every 100 steps
-				if step % 100 == 0:
-				quickval(sess, net, batch_maker, summary_writer)
-				print("===================================================")
-				"""
-            else:
-                timer.start(0)
-                sess.run(net.train_op, feed_dict={net.keep_prob: 0.5})
-                timer.end(0)
-            coord.request_stop()
-            coord.join(enqueue_threads)
+        try:
+            threads = []
+            for qrunner in tf.get_collection(tf.GraphKeys.QUEUE_RUNNERS):
+                threads.extend(qrunner.create_threads(sess, coord=coord,
+                                                    daemon=True, start=True))
+            for step in xrange(FLAGS.nb_steps):
+                # Print training summary every 10 steps
+                if coord.should_stop():
+                    break
+                if step % 10 == 0:
+                    timer.start(0)
+                    _, loss, top1, summary = sess.run([net.train_op, net.loss,
+                                            net.top1, net.merged_summary_op])
+                    timer.end(0)
+                    summary_writer.add_summary(summary)
+                    print('Step ' + str(current_step).zfill(3) +
+                          '| Loss: %.3f' % loss +
+                          '| Top1: %.3f' % top1)
+                    timer.print_performance()
+                    print("=======================================================")
+
+                else:
+                    timer.start(0)
+                    sess.run(net.train_op)
+                    timer.end(0)
+            except Exception as e:
+                coord.request_stop(e)
+            finally:
+                coord.request_stop()
+                coord.join(threads)
 
 
 def quickval(sess, net, batch_maker, summary_writer):
@@ -269,94 +270,68 @@ def quickval(sess, net, batch_maker, summary_writer):
 
 
 class InputPipeline(object):
-    def __init__(self, batch_maker):
+    def __init__(self, eval):
+        self.images = []
+        self.labels = []
+
+        maybe_download_and_extract()
+        load_data(eval)
+
         self.unprocessed_queue = tf.FIFOQueue(capacity=50000, dtypes=tf.float32,
                                          shapes=[[3 * 32 * 32], [1]])
-        self.enqueue_unprocessed = self.unprocessed_queue.enqueue_many(batch_maker.train_images)
+        self.enqueue_unprocessed = self.unprocessed_queue.enqueue_many(
+                                                [self.images, self.labels])
 
         image, label = self.unprocessed_queue.dequeue()
         # Preprocess one example
-        self.preprocessed_example = (self.preprocess(image), label)
-
-        # Queue holding preprocessed examples
-        min_after_dequeue = 10000
-        capacity = min_after_dequeue + 3 * FLAGS.batch_size
-        self.preprocessed_queue = tf.RandomShuffleQueue(capacity=capacity,
-                                                   min_after_dequeue=min_after_dequeue,
-                                                   dtypes=tf.float32,
-                                                   shapes=[[Settings.image_size, Settings.image_size, 3]])
-        self.enqueue_preprocessed = self.preprocessed_queue.enqueue(preprocessed_example)
-
-class BatchMaker(object):
-    def __init__(self):
-        self.train_images = []
-        self.train_labels = []
-        self.test_images = []
-        self.test_labels = []
-        self.load_train_data()
-        self.load_test_data()
-
-    def input_pipeline(self):
-        # Queue holding all unprocessed examples
-        unprocessed_queue = tf.FIFOQueue(capacity=50000, dtypes=tf.float32,
-                                         shapes=[[3 * 32 * 32], [1]])
-        enqueue_unprocessed = unprocessed_queue.enqueue_many(self.train_images)
-
-        image, label = unprocessed_queue.dequeue()
-        # Preprocess one example
         preprocessed_example = (self.preprocess(image), label)
 
-        # Queue holding preprocessed examples
         min_after_dequeue = 10000
         capacity = min_after_dequeue + 3 * FLAGS.batch_size
-        preprocessed_queue = tf.RandomShuffleQueue(capacity=capacity,
-                                                   min_after_dequeue=min_after_dequeue,
-                                                   dtypes=tf.float32,
-                                                   shapes=[[Settings.image_size, Settings.image_size, 3]])
-        enqueue_preprocessed = preprocessed_queue.enqueue(preprocessed_example)
-        return preprocessed_queue.dequeue_many(FLAGS.batch_size)
+        # Queue holding preprocessed examples
+        self.image_batch, self.label_batch = tf.train.shufle_batch(
+            preprocessed_example,
+            batch_size=FLAGS.batch_size,
+            num_threads=16,
+            capacity=capacity,
+            min_after_dequeue=min_after_dequeue)
 
-    def load_train_data(self):
-        # Load training data
-        maybe_download_and_extract()
-        print("Loading training data. ")
-        for current_batch in range(5):
-            with open('./cifar10_data/cifar-10-batches-py/data_batch_' + str(current_batch + 1), 'rb') as file:
-                data_dict = pickle.load(file, encoding='bytes')
-                self.train_images.extend(data_dict[b'data'])
-                self.train_labels.extend(data_dict[b'labels'])
-        return self.train_images, self.train_labels
-
-    def load_test_data(self):
-        # Load test data
-        print("Loading test data.")
-        with open('./cifar10_data/cifar-10-batches-py/test_batch', 'rb') as file:
-            data_dict = pickle.load(file, encoding='bytes')
-            self.test_images = data_dict[b'data']
-            self.test_labels = data_dict[b'labels']
-
-    def preprocess(self, image):
+    def preprocess(self, image, eval):
         depth_major = tf.reshape(image, [3, 32, 32])
         reshaped_image = tf.transpose(depth_major, [0, 2, 3, 1])
-
-        distorted_image = tf.random_crop(reshaped_image,
-                                         [Settings.image_size, Settings.image_size, 3])
-
-        distorted_image = tf.image.random_flip_left_right(distorted_image)
-
-        distorted_image = tf.image.random_brightness(distorted_image,
-                                                     max_delta=63)
-
-        distorted_image = tf.image.random_contrast(distorted_image,
-                                                   lower=0.2, upper=1.8)
+        # distort training images
+        maybe_distorted_image = tf.cond(eval, lambda:reshaped_image,
+                                        lambda:distort(reshaped_image))
 
         normalized_image = tf.image.per_image_standardization(distorted_image)
-
-        tf.summary.image('inputImage', self.images_reshaped)
-
+        tf.summary.image('inputImage', normalized_image)
         return normalized_image
 
-    @staticmethod
+    def distort(self, image):
+        distorted_image = tf.random_crop(image,
+                                [Settings.image_size, Settings.image_size, 3])
+        distorted_image = tf.image.random_flip_left_right(distorted_image)
+        distorted_image = tf.image.random_brightness(distorted_image,
+                                                     max_delta=63)
+        distorted_image = tf.image.random_contrast(distorted_image,
+                                                   lower=0.2, upper=1.8)
+        return distorted_image
+
+    def load_data(eval):
+        if eval:
+            with open('./cifar10_data/cifar-10-batches-py/test_batch', 'rb') as file:
+                data_dict = pickle.load(file, encoding='bytes')
+                self.images = data_dict[b'data']
+                self.labels = data_dict[b'labels']
+        else:
+            print("Loading training data. ")
+            for current_batch in range(5):
+                with open('./cifar10_data/cifar-10-batches-py/data_batch_' + str(current_batch + 1), 'rb') as file:
+                    data_dict = pickle.load(file, encoding='bytes')
+                    self.images.extend(data_dict[b'data'])
+                    self.labels.extend(data_dict[b'labels'])
+
+
     def maybe_download_and_extract():
         """Download and extract the tarball from Alex's website.
 		Copied from https://github.com/tensorflow/models/blob/master/tutorials/image/cifar10/cifar10.py"""
@@ -409,7 +384,5 @@ class Timer(object):
 # ##############################################################################
 
 if __name__ == '__main__':
-    maybe_download_and_extract()
-    bm = Batch_maker()
-    net = Network(bm)
-    train(net, bm)
+    net = Network()
+    train(net)
